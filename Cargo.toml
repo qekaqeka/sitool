@@ -1,0 +1,17 @@
+[package]
+name = "sishuffle"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+xsd-parser = "1.4.0"
+
+[dependencies]
+clap = { version = "4.5.60", features = ["cargo"] }
+hex = "0.4.3"
+num = "0.4.3"
+sha1 = "0.10.6"
+tempfile = "3.26.0"
+urlencoding = "2.1.3"
+xsd-parser-types = { version = "0.1.2", features = ["num", "quick-xml"] }
+zip = "8.1.0"
