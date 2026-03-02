@@ -1,20 +1,14 @@
 use std::{
-    error::Error,
-    ffi::OsStr,
-    fmt::Display,
-    fs::{self, File},
-    io::{self, BufReader, BufWriter, Read, Seek, Write},
-    path::{Path, PathBuf},
+    collections::{HashSet, VecDeque}, ffi::OsStr, fs::{self, File}, io::{self, BufReader, BufWriter, Read, Seek, Write}, path::{Path, PathBuf}
 };
 
 use hex::ToHex;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use tempfile::{TempDir, tempdir};
-use xsd_parser_types::quick_xml::{self, DeserializeSync, IoReader, SerializeSync, Writer};
+use xsd_parser_types::quick_xml::{DeserializeSync, IoReader, SerializeSync, Writer};
 use zip::{
-    ZipArchive,
-    result::{ZipError, ZipResult},
+    ZipArchive, ZipWriter, write::SimpleFileOptions
 };
 
 #[allow(unused)]
@@ -22,12 +16,24 @@ pub mod types;
 
 pub mod error;
 
-use types::mstns::Package;
+use types::Package;
 use error::SiqError;
-use crate::utils;
+use crate::{siq::types::{Param, ParamItem, Question, Round, Theme}, utils};
+
+pub const CONTENT_FILE_NAME: &str = "content.xml";
+pub const AUTHORS_FILE_NAME: &str = "authors.xml";
+pub const SOURCES_FILE_NAME: &str = "sources.xml";
+pub const QUALITY_MARKER_FILE_NAME: &str = "quality.marker";
+const ROOT_FILES: [&str; 4] = [
+    CONTENT_FILE_NAME,
+    AUTHORS_FILE_NAME,
+    SOURCES_FILE_NAME,
+    QUALITY_MARKER_FILE_NAME,
+];
 
 pub struct Siq {
-    pub package: Package,
+    pub content: Package,
+    replaces: HashMap<String, String>,
     resourses_dir: TempDir,
 }
 
@@ -49,17 +55,12 @@ fn unpack_siq<R: Read + Seek>(reader: R) -> Result<(TempDir, HashMap<String, Str
         // SHA1 hash used, because it isn't so slow and the digest takes only 40 chars, so it
         // fits the 255 chars limit of Unix
         if (file.is_file() || file.is_symlink())
-            && file.mangled_name().file_name().unwrap() != "content.xml"
+            && file.mangled_name().file_name().unwrap() != CONTENT_FILE_NAME
         {
             let mut sha1 = Sha1::new();
 
             let old_file_name: String = outpath.file_name()
                 .expect("We just checked that it is a usual file and should has name")
-                .to_string_lossy() // We can neglect strange paths
-                .to_string();
-
-            let old_file_stem: String = outpath.file_stem()
-                .expect("We just checked that it is a usual file and should has stem")
                 .to_string_lossy() // We can neglect strange paths
                 .to_string();
 
@@ -69,10 +70,10 @@ fn unpack_siq<R: Read + Seek>(reader: R) -> Result<(TempDir, HashMap<String, Str
                 .to_string();
 
             sha1.update(old_file_name.as_bytes());
-            let new_file_stem: String = sha1.finalize().encode_hex();
-            let new_file_name = format!("{new_file_stem}.{file_extension}");
+            let mangled_file_stem: String = sha1.finalize().encode_hex();
+            let mangled_file_name = format!("{mangled_file_stem}.{file_extension}");
 
-            outpath.set_file_name(&new_file_name);
+            outpath.set_file_name(&mangled_file_name);
 
             // Names are url encoded, but content.xml uses url decoded ones
             let old_file_name = urlencoding::decode(&old_file_name)
@@ -80,7 +81,7 @@ fn unpack_siq<R: Read + Seek>(reader: R) -> Result<(TempDir, HashMap<String, Str
                 .to_string();
 
             //Save our file name replacement, we will use it to patch content.xml
-            replaces.insert(old_file_name, new_file_name);
+            replaces.insert(mangled_file_name, old_file_name);
         }
 
         if file.is_symlink() {
@@ -110,58 +111,94 @@ fn unpack_siq<R: Read + Seek>(reader: R) -> Result<(TempDir, HashMap<String, Str
     Ok((dir, replaces))
 }
 
-fn patch_string(string: &mut String, replaces: &HashMap<String, String>) {
-    if let Some(val) = replaces.get(string) {
-        *string = val.clone();
+fn param_item_type_to_dirname(type_: &String) -> &str {
+    match type_.as_str() {
+        "video" => "Video",
+        "image" => "Images",
+        "audio" => "Audio",
+        _ => unreachable!("There isn't another param type for file"),
     }
 }
 
-fn patch_source(source: &mut String, replaces: &HashMap<String, String>) {
-    // skip @ in the beggining of the source
-    let mut file_path = source[1..].to_string();
+fn get_param_item_used_files(item: &ParamItem, used_files: &mut HashSet<String>) {
+    if item.is_ref.as_ref().is_some_and(|v| v == "True") {
+        let file_name = item.content.clone();
 
-    patch_string(&mut file_path, replaces);
-
-    *source = format!("@{file_path}");
-}
-
-macro_rules! patch_siq_obj_info {
-    ($id:ident, &$repls:ident) => {
-        if let Some(info) = $id.info.as_mut() {
-            if let Some(sources) = info.sources.as_mut() {
-                for source in sources.source.iter_mut() {
-                    patch_source(source, $repls)
-                }
-            }
+        let mut source_path= PathBuf::from("");
+        if let Some(type_) = &item.type_ {
+            source_path.push(param_item_type_to_dirname(type_));
         }
-    };
+
+        source_path.push(file_name);
+
+        let source_path = source_path.to_str()
+            .expect("UTF-8")
+            .to_string();
+
+        used_files.insert(source_path);
+    }
 }
 
-fn patch_package(pack: &mut Package, replaces: &HashMap<String, String>) {
-    patch_siq_obj_info!(pack, &replaces);
+fn get_param_used_files(param: &Param, used_files: &mut HashSet<String>) {
+    let mut params: VecDeque<&Param> = VecDeque::new();
+    params.push_back(param);
 
-    if let Some(logo) = pack.logo.as_mut() {
-        patch_source(logo, replaces);
+    while let Some(prm) = params.pop_front() {
+        for sub_param in prm.param.iter() {
+            params.push_back(&sub_param.value);
+        }
+
+        for item in prm.item.iter() {
+            get_param_item_used_files(&item.value, used_files);
+        }
+    }
+}
+
+fn get_question_used_files(question: &Question, used_files: &mut HashSet<String>) {
+    if let Some(params) = &question.params {
+        for param in params.param.iter() {
+            get_param_used_files(param, used_files);
+        }
+    }
+}
+
+fn get_theme_used_files(theme: &Theme, used_files: &mut HashSet<String>) {
+    if let Some(questions) = &theme.questions {
+        for question in questions.question.iter() {
+            get_question_used_files(question, used_files);
+        }
+    }
+}
+
+fn get_round_used_files(round: &Round, used_files: &mut HashSet<String>) {
+    if let Some(themes) = &round.themes {
+        for theme in themes.theme.iter() {
+            get_theme_used_files(theme, used_files);
+        }
+    }
+}
+
+fn get_package_used_files(content: &Package, used_files: &mut HashSet<String>) {
+    // Root files should be add explicitly
+    for root_file in ROOT_FILES {
+        used_files.insert(root_file.to_string());
     }
 
+    if let Some(logo_link) = &content.logo {
+        // skip @ in the beggining of string to extract file_name 
+        let logo_file_name = &logo_link[1..];
+        let logo_path_str = PathBuf::from("Images")
+            .join(logo_file_name)
+            .to_str()
+            .expect("UTF-8")
+            .to_string();
 
-    for round in pack.rounds.as_mut().unwrap().round.iter_mut() {
-        patch_siq_obj_info!(round, &replaces);
-        for theme in round.themes.as_mut().unwrap().theme.iter_mut() {
-            patch_siq_obj_info!(theme, &replaces);
-            for question in theme.questions.as_mut().unwrap().question.iter_mut() {
-                patch_siq_obj_info!(question, &replaces);
+        used_files.insert(logo_path_str);
+    }
 
-                for param_type in question.params.as_mut().unwrap().param.iter_mut() {
-                    for item in param_type.item.iter_mut() {
-                        if let Some(is_ref) = item.is_ref.as_mut() {
-                            if is_ref == "True" {
-                                patch_string(&mut item.content, replaces);
-                            }
-                        }
-                    }
-                }
-            }
+    if let Some(rounds) = &content.rounds {
+        for round in rounds.round.iter() {
+            get_round_used_files(&round, used_files);
         }
     }
 }
@@ -170,29 +207,82 @@ impl Siq {
     pub fn try_new<R: Read + Seek>(reader: R) -> Result<Siq, SiqError> {
         let (dir, replaces) = unpack_siq(reader)?;
 
-        let content = File::open((dir.path().join("content.xml")))?;
+        let content = File::open(dir.path().join(CONTENT_FILE_NAME))?;
         let content = BufReader::new(content);
         let mut content = IoReader::new(content);
-        let mut package = Package::deserialize(&mut content)?;
-
-        patch_package(&mut package, &replaces);
+        let package = Package::deserialize(&mut content)?;
 
         let res = Self {
-            package: package,
+            content: package,
             resourses_dir: dir,
+            replaces: replaces,
         };
 
         Ok(res)
     }
 
-    pub fn pack<W: Write>(&self, writer: W) -> Result<(), SiqError> {
-        let content = File::open((self.resourses_dir.path().join("content.xml")))?;
+    pub fn pack<W: Write + Seek>(&self, writer: &mut W) -> Result<(), SiqError> {
+        let content = File::create(self.resourses_dir.path().join(CONTENT_FILE_NAME))?;
         let content = BufWriter::new(content);
         let mut content = Writer::new(content);
 
-        self.package.serialize("package", &mut content)?;
+        self.content.serialize("package", &mut content)?;
 
-        unimplemented!();
+        let mut used_files = HashSet::new();
+        get_package_used_files(&self.content, &mut used_files);
+        dbg!(&used_files);
+
+        let mut zip = ZipWriter::new(writer);
+
+        let mut dir_entries: VecDeque<Result<fs::DirEntry, io::Error>> = fs::read_dir(self.resourses_dir.path())?.into_iter()
+            .collect();
+
+        while let Some(entry) = dir_entries.pop_front() {
+            let path = entry?.path();
+
+            if path.is_dir() {
+                let sub_dir_entries = fs::read_dir(path)?;
+                dir_entries.extend(sub_dir_entries.into_iter());
+            } else if path.is_file() {
+                let filename = path.file_name()
+                    .expect("file")
+                    .to_str()
+                    .expect("UTF-8");
+
+                // path filename could be mangled in the unpack_siq function
+                let demangled_filename = self.replaces.get(filename)
+                    .map_or(filename,|flnm| flnm.as_str());
+
+                let demangled_path_full = path.with_file_name(demangled_filename);
+                let demangled_path = demangled_path_full.strip_prefix(self.resourses_dir.path())
+                    .expect("all pathches should be in the resourse dir");
+                let demangled_path_str = demangled_path.to_str()
+                    .expect("UTF-8");
+
+                // Skip unused files
+                if used_files.get(demangled_path_str).is_none() {
+                    continue;
+                }
+
+                let file = File::open(&path)?;
+                let mut file = BufReader::new(file);
+
+                let options = SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+
+                // We need to use old name in the archive, because content.xml references it
+                zip.start_file_from_path(demangled_path, options)?;
+                io::copy(&mut file,&mut zip)?;
+            } else if path.is_symlink() {
+                let link_target = fs::read_link(&path)?;
+
+                let options = SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zip.add_symlink_from_path(path, link_target, options)?;
+            } else {
+                unreachable!("There isn't another dir entry type")
+            }
+        }
 
         Ok(())
     }

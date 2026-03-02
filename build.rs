@@ -27,7 +27,7 @@ fn main() -> Result<(), Error> {
 
     // Generate my_schema.rs, containing all structures and implementations defined from
     // `my-schema.xsd` and the configuration above.
-    let mut file = File::create("src/siq/types.rs")?;
+    let mut file = File::create("src/siq/types/generated.rs")?;
     file.write_all(code.to_string().as_bytes())?;
 
     Ok(())
