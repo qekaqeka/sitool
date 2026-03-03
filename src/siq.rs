@@ -124,7 +124,7 @@ fn get_param_item_used_files(item: &ParamItem, used_files: &mut HashSet<String>)
     if item.is_ref.as_ref().is_some_and(|v| v == "True") {
         let file_name = item.content.clone();
 
-        let mut source_path= PathBuf::from("");
+        let mut source_path= PathBuf::new();
         if let Some(type_) = &item.type_ {
             source_path.push(param_item_type_to_dirname(type_));
         }
@@ -144,9 +144,7 @@ fn get_param_used_files(param: &Param, used_files: &mut HashSet<String>) {
     params.push_back(param);
 
     while let Some(prm) = params.pop_front() {
-        for sub_param in prm.param.iter() {
-            params.push_back(&sub_param.value);
-        }
+        params.extend(prm.param.iter().map(|p| &p.value));
 
         for item in prm.item.iter() {
             get_param_item_used_files(&item.value, used_files);
@@ -159,6 +157,11 @@ fn get_question_used_files(question: &Question, used_files: &mut HashSet<String>
         for param in params.param.iter() {
             get_param_used_files(param, used_files);
         }
+    }
+
+    if let Some(_scenario) = &question.scenario {
+        // Scenario can use files too
+        unimplemented!();
     }
 }
 
@@ -185,15 +188,17 @@ fn get_package_used_files(content: &Package, used_files: &mut HashSet<String>) {
     }
 
     if let Some(logo_link) = &content.logo {
-        // skip @ in the beggining of string to extract file_name 
-        let logo_file_name = &logo_link[1..];
-        let logo_path_str = PathBuf::from("Images")
-            .join(logo_file_name)
-            .to_str()
-            .expect("UTF-8")
-            .to_string();
+        if logo_link.chars().nth(0).is_some_and(|c| c == '@') {
+            // skip @ in the beggining of string to extract file_name 
+            let logo_file_name = &logo_link[1..];
+            let logo_path_str = PathBuf::from("Images")
+                .join(logo_file_name)
+                .to_str()
+                .expect("UTF-8")
+                .to_string();
 
-        used_files.insert(logo_path_str);
+            used_files.insert(logo_path_str);
+        }
     }
 
     if let Some(rounds) = &content.rounds {
@@ -227,6 +232,7 @@ impl Siq {
         let mut content = Writer::new(content);
 
         self.content.serialize("package", &mut content)?;
+        drop(content);
 
         let mut used_files = HashSet::new();
         get_package_used_files(&self.content, &mut used_files);
@@ -251,7 +257,7 @@ impl Siq {
 
                 // path filename could be mangled in the unpack_siq function
                 let demangled_filename = self.replaces.get(filename)
-                    .map_or(filename,|flnm| flnm.as_str());
+                    .map_or(filename, |flnm| flnm.as_str());
 
                 let demangled_path_full = path.with_file_name(demangled_filename);
                 let demangled_path = demangled_path_full.strip_prefix(self.resourses_dir.path())

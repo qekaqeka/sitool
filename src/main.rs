@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
 use std::io::{self, BufReader, BufWriter, prelude::*};
-use std::path::Path;
 use std::{fs::File, path::PathBuf};
 use std::env;
+use clap::builder::{StringValueParser, TypedValueParser, ValueParserFactory};
 use sishuffle::siq::Siq;
 use sishuffle::siq::types::{Package, Param, Question, Round, Theme};
 use wildmatch::WildMatch;
-use clap::{ArgAction, ArgMatches, Command, arg, command, value_parser};
+use clap::{Arg, ArgAction, ArgMatches, Command, arg, command, value_parser};
 
 fn filter_questions<F>(content: &mut Package, f: F)
 where F: Fn(&Question) -> bool {
@@ -41,17 +41,6 @@ where F: Fn(&Round) -> bool {
     }
 }
 
-fn wordlist_from_path<P: AsRef<Path>>(path: P) -> Result<Vec<WildMatch>, io::Error> {
-    let file = BufReader::new(File::open(path).unwrap());
-    let res = file.lines()
-        .collect::<Result<Vec<String>, io::Error>>()?
-        .into_iter()
-        .map(|s| WildMatch::new_case_insensitive(s.as_str()))
-        .collect();
-
-    Ok(res)
-}
-
 fn question_question_match_pattern(question: &Question, pattern: &WildMatch) -> bool {
     let mut params_queue: VecDeque<&Param> = VecDeque::new();
 
@@ -80,39 +69,91 @@ fn question_question_match_pattern(question: &Question, pattern: &WildMatch) -> 
     false
 }
 
+#[derive(Clone)]
+struct Filter {
+    wordlist: Vec<WildMatch>,
+    inverted: bool,
+}
+
+impl ValueParserFactory for Filter {
+    type Parser = FilterValueParser;
+    fn value_parser() -> Self::Parser {
+        FilterValueParser
+    }
+}
+
+#[derive(Clone)]
+struct FilterValueParser;
+
+impl TypedValueParser for FilterValueParser {
+    type Value = Filter;
+
+    fn parse_ref(
+            &self,
+            cmd: &Command,
+            arg: Option<&Arg>,
+            value: &std::ffi::OsStr,
+        ) -> Result<Self::Value, clap::Error> {
+        let inner = StringValueParser::new();
+        let val = inner.parse_ref(cmd, arg, value)?;
+
+        let (path, inverted) = if val.starts_with('!') {
+            (PathBuf::from(&val[1..]), true)
+        } else {
+            (PathBuf::from(val), false)
+        };
+
+        let file = File::open(path)?;
+        let file = BufReader::new(file);
+
+        let wordlist = file.lines()
+            .map(|r| r.map(|l| WildMatch::new(l.as_str())))
+            .collect::<Result<Vec<WildMatch>, io::Error>>()?;
+
+        let res = Self::Value {
+            wordlist: wordlist,
+            inverted: inverted,
+        };
+
+        Ok(res)
+    }
+}
+
 fn filter(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
     let input_siq_file = File::open(matches.get_one::<PathBuf>("input").expect("required"))?;
     let mut input_siq = Siq::try_new(input_siq_file).unwrap();
 
-    let themes_wordlist = matches.get_one::<PathBuf>("themes-wordlist")
-        .map_or(Ok(Vec::new()), wordlist_from_path)?;
+    let themes_filter = matches.get_one::<Filter>("themes-wordlist");
 
-    let questions_answers_wordlist = matches.get_one::<PathBuf>("questions-answers-wordlist")
-        .map_or(Ok(Vec::new()), wordlist_from_path)?;
+    let questions_answers_filter = matches.get_one::<Filter>("questions-answers-wordlist");
 
-    let questions_questions_wordlist= matches.get_one::<PathBuf>("questions-questions-wordlist")
-        .map_or(Ok(Vec::new()), wordlist_from_path)?;
+    let questions_questions_filter= matches.get_one::<Filter>("questions-questions-wordlist");
 
-    let invert = matches.get_flag("invert");
+    if let Some(themes_filter) = themes_filter {
+        filter_themes(&mut input_siq.content, |t|
+            !themes_filter.wordlist.iter().any(|pattern| pattern.matches(&t.name) ^ themes_filter.inverted)
+        );
+    }
 
+    if let Some(qq_filter) = questions_questions_filter {
+        filter_questions(&mut input_siq.content, |q|
+            !(q.right.answer.iter().any(|answer| 
+                qq_filter.wordlist.iter().any(|pattern| pattern.matches(answer) ^ qq_filter.inverted)
+            ) &&
+            q.wrong.as_ref().map_or(true, |answers| 
+                answers.answer.iter().any(|answer| 
+                    qq_filter.wordlist.iter().any(|pattern| pattern.matches(answer) ^ qq_filter.inverted)
 
-    filter_themes(&mut input_siq.content, |t|
-        !themes_wordlist.iter().any(|pattern| pattern.matches(&t.name)) ^ invert
-    );
+                )
+            ))
+        );
+    }
 
-    filter_questions(&mut input_siq.content, |q|
-        !(q.right.answer.iter().any(|answer| 
-            questions_answers_wordlist.iter().any(|pattern| pattern.matches(answer))
-        ) &&
-        q.wrong.as_ref().map_or(true, |answers| 
-            answers.answer.iter().any(|answer| 
-                questions_answers_wordlist.iter().any(|pattern| pattern.matches(answer))
-            )
-        )) ^ invert
-    );
-    filter_questions(&mut input_siq.content, |q|
-        !questions_questions_wordlist.iter().any(|pattern| question_question_match_pattern(q, pattern))
-    );
+    if let Some(qa_filter) = questions_answers_filter {
+        filter_questions(&mut input_siq.content, |q|
+            !qa_filter.wordlist.iter().any(|pattern| question_question_match_pattern(q, pattern) ^ qa_filter.inverted)
+        );
+    }
 
 
     // We are not interested in empty rounds and themes
@@ -145,19 +186,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .value_parser(value_parser!(PathBuf))
                     .required(true)
                 )
-                .arg(arg!(-n --invert "Invert filters")
-                    .action(ArgAction::SetTrue)
+                .arg(arg!(--"themes-wordlist" <FILTER> "Words to filter themes")
+                    .value_parser(value_parser!(Filter))
                 )
-                .arg(arg!(--"themes-wordlist" <FILE> "Words to filter themes")
-                    .value_parser(value_parser!(PathBuf))
+                .arg(arg!(--"questions-answers-wordlist" <FILTER> "Words to filter questions by answers")
+                    .value_parser(value_parser!(Filter))
                 )
-                .arg(arg!(--"questions-answers-wordlist" <FILE> "Words to filter questions by answers")
-                    .value_parser(value_parser!(PathBuf))
+                .arg(arg!(--"questions-questions-wordlist" <FILTER> "Words to filter questions by questions")
+                    .value_parser(value_parser!(Filter))
                 )
-                .arg(arg!(--"questions-questions-wordlist" <FILE> "Words to filter questions by questions")
-                    .value_parser(value_parser!(PathBuf))
-                )
-        ).get_matches();
+        )
+        .after_help("FILTER - [!]FILE\nUse ! to invert filter")
+        .get_matches();
 
     match matches.subcommand() {
         Some(("filter", sub_matches)) => filter(sub_matches),

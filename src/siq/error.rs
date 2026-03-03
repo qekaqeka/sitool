@@ -41,5 +41,14 @@ impl Display for SiqError {
     }
 }
 
-impl Error for SiqError {}
+impl Error for SiqError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Zip(e) => Some(e),
+            Self::Io(e) => Some(e),
+            Self::BadContentXML(e) => Some(e),
+            Self::BadFilename => None,
+        }
+    }
+}
 
