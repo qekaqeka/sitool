@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
+use xsd_parser::config::ParserFlags;
 use xsd_parser::{
     Config, Error,
     config::{GeneratorFlags, InterpreterFlags, OptimizerFlags, Schema},
@@ -11,7 +12,7 @@ use xsd_parser::{
 fn main() -> Result<(), Error> {
     let config = Config::default()
         .with_schema(Schema::File("assets/siq_5.xsd".into()))
-        .with_interpreter_flags(InterpreterFlags::all())
+        .with_interpreter_flags(InterpreterFlags::all() - InterpreterFlags::WITH_NUM_BIG_INT)
         .with_optimizer_flags(OptimizerFlags::all())
         .with_generator_flags(GeneratorFlags::all())
         .with_quick_xml();

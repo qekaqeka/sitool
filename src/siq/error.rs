@@ -1,15 +1,15 @@
-use std::io;
-use zip::result::ZipError;
-use xsd_parser_types::quick_xml;
-use std::fmt::Display;
 use std::error::Error;
+use std::fmt::Display;
+use std::io;
+use xsd_parser_types::quick_xml;
+use zip::result::ZipError;
 
 #[derive(Debug)]
 pub enum SiqError {
     Zip(ZipError),
     Io(io::Error),
     BadContentXML(quick_xml::Error),
-    BadFilename,
+    FailedToConvert(&'static str),
 }
 
 impl From<ZipError> for SiqError {
@@ -36,7 +36,7 @@ impl Display for SiqError {
             Self::Zip(e) => write!(f, "zip error: {e}"),
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::BadContentXML(e) => write!(f, "bad context.xml: {e}"),
-            Self::BadFilename => write!(f, "bad filename found"),
+            Self::FailedToConvert(s) => write!(f, "{s}"),
         }
     }
 }
@@ -47,8 +47,7 @@ impl Error for SiqError {
             Self::Zip(e) => Some(e),
             Self::Io(e) => Some(e),
             Self::BadContentXML(e) => Some(e),
-            Self::BadFilename => None,
+            Self::FailedToConvert(_) => None,
         }
     }
 }
-
