@@ -6,6 +6,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use chrono::DateTime;
+use chrono::Utc;
 use generated as internal_types;
 
 use internal_types::InfoType as InternalInfo;
@@ -54,11 +56,11 @@ pub(super) trait SiqFacageElement<Internal>:
     TryFrom<Internal, Error = SiqError> + Into<Internal> + Clone
 {
     fn bind_zip<P: AsRef<Path>>(&mut self, zip_path: P) {
-        panic!("can't be binded");
+        unimplemented!()
     }
 
     fn pack<W: Write + Seek>(&self, dest: &mut ZipWriter<W>) -> Result<(), SiqError> {
-        panic!("can't be packed");
+        unimplemented!()
     }
 }
 
@@ -319,15 +321,41 @@ pub struct Atom {
     pub type_: Option<AtomType>,
     pub time: Option<f64>,
     pub content: String,
+
+    filedep: Option<FileDep>,
 }
 
 impl TryFrom<InternalAtom> for Atom {
     type Error = SiqError;
     fn try_from(internal: InternalAtom) -> Result<Self, Self::Error> {
+        let atom_type = internal.type_.map(|t| t.into());
+        let mut filedep = None;
+
+        if let Some(at) = atom_type.as_ref() && internal.content.starts_with('@') {
+            let filename = &internal.content[1..];
+            match at {
+                AtomType::Image => {
+                    let path = Path::new("Images").join(filename);
+                    filedep = Some(FileDep::new_compressed(path, FileDepDstDir::Images));
+                },
+                AtomType::Video => {
+                    let path = Path::new("Video").join(filename);
+                    filedep = Some(FileDep::new_compressed(path, FileDepDstDir::Video));
+                },
+                AtomType::Voice => {
+                    let path = Path::new("Voice").join(filename);
+                    filedep = Some(FileDep::new_compressed(path, FileDepDstDir::Audio));
+                },
+                _ => (),
+            }
+        }
+
         let res = Self {
-            type_: internal.type_.map(|t| t.into()),
+            type_: atom_type,
             time: internal.time,
             content: internal.content,
+
+            filedep: filedep,
         };
 
         Ok(res)
@@ -336,15 +364,41 @@ impl TryFrom<InternalAtom> for Atom {
 
 impl Into<InternalAtom> for Atom {
     fn into(self) -> InternalAtom {
+        let content = if let Some(fd) = self.filedep {
+            let filename = fd.get_dst_path()
+                .file_name()
+                .expect("file")
+                .to_str()
+                .expect("UTF-8")
+                .to_string();
+
+            format!("@{}", filename)
+        } else {
+            self.content
+        };
+
         InternalAtom {
             type_: self.type_.map(|t| t.into()),
             time: self.time,
-            content: self.content,
+            content: content,
         }
     }
 }
 
-impl SiqFacageElement<InternalAtom> for Atom {}
+impl SiqFacageElement<InternalAtom> for Atom {
+    fn bind_zip<P: AsRef<Path>>(&mut self, zip_path: P) {
+        self.filedep.as_mut()
+            .map(|fd| fd.bind_zip_path(zip_path));
+    }
+
+    fn pack<W: Write + Seek>(&self, dest: &mut ZipWriter<W>) -> Result<(), SiqError> {
+        if let Some(fd) = self.filedep.as_ref() {
+            fd.pack(dest)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Scenario {
@@ -374,7 +428,17 @@ impl Into<InternalScenario> for Scenario {
     }
 }
 
-impl SiqFacageElement<InternalScenario> for Scenario {}
+impl SiqFacageElement<InternalScenario> for Scenario {
+    fn bind_zip<P: AsRef<Path>>(&mut self, zip_path: P) {
+        self.atoms.iter_mut()
+            .for_each(|atom| atom.bind_zip(zip_path.as_ref()));
+    }
+
+    fn pack<W: Write + Seek>(&self, dest: &mut ZipWriter<W>) -> Result<(), SiqError> {
+        self.atoms.iter()
+            .try_for_each(|atom| atom.pack(dest))
+    }
+}
 
 #[derive(Clone, Debug)]
 enum ParamItemType {
@@ -440,7 +504,7 @@ impl FromStr for ParamItemPlacement {
     type Err = SiqError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            ("" | "screen") => Ok(Self::Screen),
+            ("screen") => Ok(Self::Screen),
             ("replic") => Ok(Self::Replic),
             ("background") => Ok(Self::Background),
             _ => Err(Self::Err::FailedToConvert("bad param item placement")),
@@ -464,7 +528,7 @@ impl ToString for ParamItemPlacement {
 struct ParamItem {
     type_: Option<ParamItemType>,
     is_ref: bool,
-    placement: ParamItemPlacement,
+    placement: Option<ParamItemPlacement>,
     duration: Option<String>,
     wait_for_finish: bool,
     content: String,
@@ -476,10 +540,10 @@ impl TryFrom<InternalParamItem> for ParamItem {
     type Error = SiqError;
     fn try_from(internal: InternalParamItem) -> Result<Self, Self::Error> {
         let placement = if let Some(pl) = internal.placement {
-            ParamItemPlacement::from_str(&pl)?
+            Some(ParamItemPlacement::from_str(&pl)?)
         } else {
             // Screen is the default placement
-            ParamItemPlacement::Screen
+            None
         };
 
         let type_ = if let Some(tp) = internal.type_ {
@@ -541,7 +605,7 @@ impl Into<InternalParamItem> for ParamItem {
         InternalParamItem {
             type_: self.type_.map(|t| t.to_string()),
             is_ref: self.is_ref.then_some("True".to_string()),
-            placement: Some(self.placement.to_string()),
+            placement: self.placement.map(|pl| pl.to_string()),
             duration: self.duration,
             wait_for_finish: self.wait_for_finish.then_some("True".to_string()),
             content: content,
@@ -876,11 +940,18 @@ impl SiqFacageElement<InternalQuestion> for Question {
 
         self.params.iter_mut()
             .for_each(|p| p.bind_zip(zip_path.as_ref()));
+
+        self.scenario.as_mut()
+            .map(|scn| scn.bind_zip(zip_path.as_ref()));
     }
 
     fn pack<W: Write + Seek>(&self, dest: &mut ZipWriter<W>) -> Result<(), SiqError> {
         if let Some(sc) = self.script.as_ref() {
             sc.pack(dest)?;
+        }
+
+        if let Some(scn) = self.scenario.as_ref() {
+            scn.pack(dest)?;
         }
 
         self.params.iter()
@@ -951,7 +1022,7 @@ impl SiqFacageElement<InternalTheme> for Theme {
 
 #[derive(Clone, Debug)]
 pub enum RoundType {
-    Common,
+    Common(String),
     Final,
 }
 
@@ -961,22 +1032,16 @@ impl FromStr for RoundType {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.as_ref() {
             "final" => Ok(Self::Final),
-            _ => Err(SiqError::FailedToConvert("failed to convert round type")),
+            _ => Ok(Self::Common(value.to_string())),
         }
     }
 }
 
-impl Default for RoundType {
-    fn default() -> Self {
-        Self::Common
-    }
-}
-
 impl RoundType {
-    fn into_internal_round_type(self) -> Option<String> {
+    fn into_internal_round_type(self) -> String {
         match self {
-            Self::Final => Some("final".to_string()),
-            Self::Common => None,
+            Self::Final => "final".to_string(),
+            Self::Common(s) => s,
         }
     }
 }
@@ -985,7 +1050,7 @@ impl RoundType {
 pub struct Round {
     pub info: Option<Info>,
     pub name: String,
-    pub type_: RoundType,
+    pub type_: Option<RoundType>,
     pub themes: Vec<Theme>,
 }
 
@@ -1008,9 +1073,9 @@ impl TryFrom<InternalRound> for Round {
         };
 
         let round_type = if let Some(rt) = internal.type_ {
-            RoundType::from_str(&rt)?
+            Some(RoundType::from_str(&rt)?)
         } else {
-            RoundType::default()
+            None
         };
 
         let res = Self {
@@ -1031,7 +1096,7 @@ impl Into<InternalRound> for Round {
         InternalRound {
             info: self.info.map(|i| i.into()),
             name: self.name,
-            type_: self.type_.into_internal_round_type(),
+            type_: self.type_.map(|t| t.into_internal_round_type()),
             themes: Some(InternalThemes { theme: themes }),
         }
     }
@@ -1053,7 +1118,7 @@ impl Default for Round {
         Self {
             info: None,
             name: String::default(),
-            type_: RoundType::default(),
+            type_: None,
             themes: Vec::new(),
         }
     }
@@ -1190,7 +1255,6 @@ impl SiqFacageElement<InternalPackage> for Package {
 
     fn pack<W: Write + Seek>(&self, dest: &mut ZipWriter<W>) -> Result<(), SiqError> {
         if let Some(ll) = &self.logo_link {
-            dbg!(ll);
             ll.pack(dest)?;
         }
 
@@ -1201,20 +1265,28 @@ impl SiqFacageElement<InternalPackage> for Package {
 
 impl Default for Package {
     fn default() -> Self {
+        let info = Info {
+            authors_names: vec!["sitool".to_string()],
+            sources_strs: Vec::new(),
+            comments: None,
+            showman_comments: None,
+            extension: None,
+        };
+
         Self {
-            info: None,
+            info: Some(info),
             rounds: Vec::new(),
             tags: Vec::new(),
             global: None,
-            id: None,
+            id: Some(Uuid::new_v4().to_string()),
             name: String::default(),
-            version: 1f64,
+            version: 5f64,
             restriction: None,
-            date: None,
+            date: Some(Utc::now().format("%d.%m.%Y").to_string()),
             publisher: None,
-            difficulty: None,
-            language: None,
-            generator: None,
+            difficulty: Some(1),
+            language: Some("en-US".into()),
+            generator: Some("generator".into()),
             contact_uri: None,
             logo: None,
 
@@ -1244,7 +1316,6 @@ impl Package {
 
     pub(super) fn serialize<W: Write>(&self, writer: &mut Writer<W>) -> Result<(), SiqError> {
         let internal: InternalPackage = self.clone().into();
-        dbg!(&internal);
 
         internal.serialize("package", writer)?;
 

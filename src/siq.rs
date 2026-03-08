@@ -1,12 +1,10 @@
 use std::{
-    collections::{HashSet, VecDeque},
-    ffi::OsStr,
-    fs::{self, File},
-    io::{self, BufReader, BufWriter, Read, Seek, Write},
-    path::{Path, PathBuf},
+    fs::File,
+    io::{BufReader, Seek, Write},
+    path::Path,
 };
 
-use xsd_parser_types::quick_xml::{DeserializeSync, IoReader, SerializeSync, Writer};
+use xsd_parser_types::quick_xml::{IoReader, Writer};
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 #[allow(unused)]
@@ -18,15 +16,6 @@ use error::SiqError;
 use types::{Package, SiqFacageElement};
 
 pub const CONTENT_FILE_NAME: &str = "content.xml";
-pub const AUTHORS_FILE_NAME: &str = "authors.xml";
-pub const SOURCES_FILE_NAME: &str = "sources.xml";
-pub const QUALITY_MARKER_FILE_NAME: &str = "quality.marker";
-const ROOT_FILES: [&str; 4] = [
-    CONTENT_FILE_NAME,
-    AUTHORS_FILE_NAME,
-    SOURCES_FILE_NAME,
-    QUALITY_MARKER_FILE_NAME,
-];
 
 #[derive(Debug)]
 pub struct Siq {

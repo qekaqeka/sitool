@@ -53,7 +53,7 @@ impl FileDepSrc {
 
                 *z = Some(zip_path.as_ref().to_path_buf())
             }
-            _ => panic!("Only compressed filedep can be binded"),
+            _ => panic!("Only compressed filedepsrc can be binded"),
         }
     }
 
@@ -205,9 +205,9 @@ impl FileDep {
                     return Err(SiqError::Io(err));
                 };
 
-                let dst_file = zip.by_index_raw(index)?;
+                let src_file = zip.by_index_raw(index)?;
 
-                dest.raw_copy_file_to_path(dst_file, dst)?;
+                dest.raw_copy_file_to_path(src_file, dst)?;
             }
         }
 

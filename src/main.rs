@@ -3,16 +3,7 @@ use sitool::siq::Siq;
 use uuid::Uuid;
 use wildmatch::WildMatch;
 use std::{env, fs::{self, File}, io::{self, BufRead, BufReader, BufWriter}, path::PathBuf};
-use sitool::siq::types::{Package, Round, Theme, Question};
-
-fn filter_questions<F>(content: &mut Package, f: F)
-where F: Fn(&Question) -> bool {
-    for round in content.rounds.iter_mut() {
-        for theme in round.themes.iter_mut() {
-            theme.questions.retain(&f);
-        }
-    }
-}
+use sitool::siq::types::{Package, Round, Theme};
 
 fn filter_themes<F>(content: &mut Package, f: F)
 where F: Fn(&Theme) -> bool {
@@ -25,19 +16,6 @@ fn filter_rounds<F>(content: &mut Package, f: F)
 where F: Fn(&Round) -> bool {
     content.rounds.retain(&f);
 }
-fn question_answers_match_pattern(question: &Question, pattern: &WildMatch) -> bool {
-    let rigth_match = question.right_answers.iter()
-        .any(|answer| pattern.matches(answer));
-
-    if rigth_match {
-        return rigth_match;
-    }
-
-    let wrong_match = question.wrong_answers.iter()
-        .any(|answer| pattern.matches(answer));
-
-    return wrong_match; // right_match is always false here
-}
 
 fn show_themes(content: &Package) {
     for round in content.rounds.iter() {
@@ -48,14 +26,15 @@ fn show_themes(content: &Package) {
 }
 
 fn filter(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
-    let input_siq_path = matches.get_one::<PathBuf>("input").expect("required");
+    let input_siq_path = matches.get_one::<PathBuf>("input")
+        .expect("required");
     let mut input_siq = Siq::try_new(input_siq_path)?;
 
+    let output_siq_file =  File::create(matches.get_one::<PathBuf>("output").expect("required"))
+        .unwrap();
+    let mut output_siq_file = BufWriter::new(output_siq_file);
+
     let themes_filter = matches.get_one::<Filter>("themes-filter");
-
-    let questions_answers_filter = matches.get_one::<Filter>("questions-answers-filter");
-
-    let questions_questions_filter= matches.get_one::<Filter>("questions-questions-filter");
 
     let show_themes_opt = matches.get_flag("show-themes");
 
@@ -65,21 +44,6 @@ fn filter(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    if let Some(qa_filter) = questions_answers_filter {
-        filter_questions(&mut input_siq.content,|q|
-            !qa_filter.wordlist.iter().any(|pattern| question_answers_match_pattern(q, pattern)) ^ qa_filter.inverted
-        );
-    }
-
-    /*
-    if let Some(qq_filter) = questions_questions_filter {
-        filter_questions(&mut input_siq.content, |q|
-            !qq_filter.wordlist.iter().any(|pattern| question_question_match_pattern(q, pattern)) ^ qq_filter.inverted
-        );
-    }
-    */
-
-
     // We are not interested in empty rounds and themes
     filter_themes(&mut input_siq.content, |t|
         !t.questions.is_empty()
@@ -88,15 +52,11 @@ fn filter(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
         !r.themes.is_empty()
     );
 
-
-    let output_siq_file =  File::create(matches.get_one::<PathBuf>("output").expect("required")).unwrap();
-    let mut output_siq_file = BufWriter::new(output_siq_file);
-
     if show_themes_opt {
         show_themes(&input_siq.content);
     }
     
-    input_siq.pack(&mut output_siq_file).unwrap();
+    input_siq.pack(&mut output_siq_file)?;
 
     Ok(())
 }
@@ -118,6 +78,8 @@ fn repack(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
     assert!(max_themes > 0);
     assert!(max_rounds > 0);
 
+    let logo_path = matches.get_one::<PathBuf>("logo");
+
     let dir_path = matches.get_one::<PathBuf>("input")
         .expect("required");
     let dir = fs::read_dir(dir_path)?;
@@ -126,6 +88,11 @@ fn repack(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
         .expect("required");
 
     let mut accumulator = Package::default();
+
+    if let Some(logo) = logo_path {
+        accumulator.set_logo(logo);
+    }
+
     let mut tmp_round = Round::default();
 
     for entry in dir {
@@ -136,7 +103,11 @@ fn repack(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let siq = Siq::try_new(path)?;
+        let siq = if let Ok(sq) = Siq::try_new(path) {
+            sq
+        } else {
+            continue;
+        };
 
         for round in siq.content.rounds.iter() {
             for theme in round.themes.iter() {
@@ -148,6 +119,7 @@ fn repack(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if accumulator.rounds.len() == max_rounds {
+                    // Generate name for the output siq file
                     let dest_filename = Uuid::new_v4()
                         .to_string();
                     let dest_filename = PathBuf::from(dest_filename)
@@ -188,6 +160,54 @@ fn repack(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
         output_siq.pack(&mut file)?;
     }
     
+    Ok(())
+}
+
+fn reprice(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
+    let input_siq_path = matches.get_one::<PathBuf>("input")
+        .expect("required");
+    let mut input_siq = Siq::try_new(input_siq_path)?;
+
+    let output_siq_path = matches.get_one::<PathBuf>("output")
+        .expect("required");
+    let mut output_siq = File::create(output_siq_path)?;
+
+    let base_price = matches.get_one::<i32>("base-price")
+        .expect("has default")
+        .to_owned();
+
+    let base_max_price = matches.get_one::<i32>("base-max-price")
+        .expect("has default")
+        .to_owned();
+
+    let base_incr = matches.get_one::<i32>("base-increment")
+        .expect("has default")
+        .to_owned();
+
+    let round_base_price_incr = matches.get_one::<i32>("round-base-price-increment")
+        .expect("has default")
+        .to_owned();
+
+    let mut cur_base_price = base_price;
+    let mut cur_base_max_price = base_max_price;
+
+    for round in input_siq.content.rounds.iter_mut() {
+        for theme in round.themes.iter_mut() {
+            let mut cur_price = cur_base_price;
+
+            for question in theme.questions.iter_mut() {
+                question.price = cur_price;
+
+                cur_price = Ord::min(cur_base_max_price, cur_price + base_incr);
+            }
+        }
+
+        cur_base_price += round_base_price_incr;
+        cur_base_max_price += round_base_price_incr;
+    }
+
+    input_siq.pack(&mut output_siq)?;
+
     Ok(())
 }
 
@@ -245,27 +265,21 @@ impl TypedValueParser for FilterValueParser {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = command!()
         .subcommand(
-            Command::new("filter")
-                .about("Filter out questions by key words")
-                .arg(arg!(-i --input <FILE> "Input siq file")
-                    .value_parser(value_parser!(PathBuf))
-                    .required(true)
-                )
-                .arg(arg!(-o --output <FILE> "Output siq file")
-                    .value_parser(value_parser!(PathBuf))
-                    .required(true)
-                )
-                .arg(arg!(--"themes-filter" <FILTER> "Filter for themes")
-                    .value_parser(value_parser!(Filter))
-                )
-                .arg(arg!(--"questions-answers-filter" <FILTER> "Filter for questions by answers")
-                    .value_parser(value_parser!(Filter))
-                )
-                .arg(arg!(--"questions-questions-filter" <FILTER> "Filter for questions by questions")
-                    .value_parser(value_parser!(Filter))
-                )
-                .arg(arg!(--"show-themes"))
-                .after_help("FILTER - [!]WORDLIST_FILE\nUse ! to invert filter")
+        Command::new("filter")
+            .about("Filter out questions by key words")
+            .arg(arg!(-i --input <FILE> "Input siq file")
+                .value_parser(value_parser!(PathBuf))
+                .required(true)
+            )
+            .arg(arg!(-o --output <FILE> "Output siq file")
+                .value_parser(value_parser!(PathBuf))
+                .required(true)
+            )
+            .arg(arg!(--"themes-filter" <FILTER> "Filter for themes")
+                .value_parser(value_parser!(Filter))
+            )
+            .arg(arg!(--"show-themes"))
+            .after_help("FILTER - [!]WORDLIST_FILE\nUse ! to invert filter")
         )
         .subcommand(
             Command::new("repack")
@@ -286,12 +300,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .value_parser(value_parser!(u32).range(1..))
                 .default_value("7")
             )
+            .arg(arg!(--logo <FILE> "Logo for repacked packs")
+                .value_parser(value_parser!(PathBuf))
+            )
+        )
+        .subcommand(
+        Command::new("reprice")
+            .about("fix questions prices")
+            .arg(arg!(-i --input <FILE> "Input siq file")
+                .value_parser(value_parser!(PathBuf))
+                .required(true)
+            )
+            .arg(arg!(-o --output <FILE> "Output siq file")
+                .value_parser(value_parser!(PathBuf))
+                .required(true)
+            )
+            .arg(arg!(--"base-price" <NR> "Base price")
+                .value_parser(value_parser!(i32))
+                .default_value("100")
+            )
+            .arg(arg!(--"base-max-price" <NR> "Base max price")
+                .value_parser(value_parser!(i32))
+                .default_value("800")
+            )
+            .arg(arg!(--"base-increment" <NR> "Base increment")
+                .value_parser(value_parser!(i32))
+                .default_value("100")
+            )
+            .arg(arg!(--"round-base-price-increment" <NR> "Per round base price increment")
+                .value_parser(value_parser!(i32))
+                .default_value("100")
+            )
         )
         .get_matches();
 
     match matches.subcommand() {
         Some(("filter", sub_matches)) => filter(sub_matches),
         Some(("repack", sub_matches)) => repack(sub_matches),
+        Some(("reprice", sub_matches)) => reprice(sub_matches),
         _ => {
             println!("Unknown command");
             Ok(())

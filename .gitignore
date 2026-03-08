@@ -1,3 +1,4 @@
 /target
 /src/siq/types/generated.rs
 test*
+/stuff

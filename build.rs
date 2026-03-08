@@ -2,7 +2,6 @@ use std::fs::File;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
-use xsd_parser::config::ParserFlags;
 use xsd_parser::{
     Config, Error,
     config::{GeneratorFlags, InterpreterFlags, OptimizerFlags, Schema},
